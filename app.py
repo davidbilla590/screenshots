@@ -1,7 +1,6 @@
 import streamlit as st
 import asyncio
 import io
-import base64
 from PIL import Image
 from playwright.async_api import async_playwright
 from google import genai
@@ -9,10 +8,15 @@ from google import genai
 st.set_page_config(page_title="POP Tear Sheet Generator", layout="wide")
 st.title("Ad Replacement & POP Generator")
 
-# Sidebar: Credentials
+# Sidebar: Credentials & Region
 with st.sidebar:
     st.header("API Configuration")
     browserless_key = st.text_input("Browserless API Key", type="password")
+    browserless_region = st.selectbox(
+        "Browserless Fleet",
+        ["production-sfo.browserless.io", "production-lon.browserless.io", "chrome.browserless.io"],
+        help="Use production-sfo for standard free accounts"
+    )
     gemini_key = st.text_input("Gemini API Key", type="password")
 
 # Form Inputs
@@ -42,29 +46,36 @@ def evaluate_brand_safety(gemini_client, headline_and_text, guidelines):
     SAFE: [YES or NO]
     REASON: [Brief 1-sentence reason]
     """
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-    return response.text
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        return response.text
+    except Exception as e:
+        return f"Safety check skipped: {e}"
 
 def perform_vision_qa(gemini_client, image_bytes, ad_size_str):
-    image = Image.open(io.BytesIO(image_bytes))
-    prompt = f"""
-    Inspect this full screenshot of a webpage. 
-    1. Confirm if a {ad_size_str} ad creative is cleanly visible and aligned in the layout.
-    2. Ensure it does not look clipped, broken, or overlapping text.
-    Return: 'VERIFIED' or 'ISSUE DETECTED' along with a brief explanation.
-    """
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[prompt, image]
-    )
-    return response.text
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        prompt = f"""
+        Inspect this full screenshot of a webpage. 
+        1. Confirm if a {ad_size_str} ad creative is cleanly visible and aligned in the layout.
+        2. Ensure it does not look clipped, broken, or overlapping text.
+        Return: 'VERIFIED' or 'ISSUE DETECTED' along with a brief explanation.
+        """
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[prompt, image]
+        )
+        return response.text
+    except Exception as e:
+        return f"Vision QA skipped: {e}"
 
-async def capture_tear_sheet(url, w, h, creative_html, token):
-    # Connect to Browserless cloud instance via WebSocket
-    endpoint_url = f"wss://chrome.browserless.io?token={token}"
+async def capture_tear_sheet(url, w, h, creative_html, host, token):
+    # Connect using selected Browserless fleet endpoint
+    endpoint_url = f"wss://{host}?token={token}&stealth=true"
+    
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(endpoint_url)
         context = await browser.new_context(
@@ -73,51 +84,72 @@ async def capture_tear_sheet(url, w, h, creative_html, token):
         )
         page = await context.new_page()
         
-        # Navigate
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(3) # Wait for client-side ad scripts to fire
+        try:
+            # Load page with 'load' or fallback to commit so heavy trackers don't crash the tab
+            await page.goto(url, wait_until="commit", timeout=45000)
+            await asyncio.sleep(4)  # Wait for layout & ads to hydrate
 
-        # Extract basic page text for safety analysis
-        page_summary = await page.evaluate("() => document.title + ' ' + (document.querySelector('article, main, body')?.innerText.slice(0, 1500) || '')")
+            # Handle consent popups if present
+            for selector in ["button:has-text('Accept')", "button:has-text('Agree')", "#onetrust-accept-btn-handler"]:
+                try:
+                    if await page.is_visible(selector, timeout=1500):
+                        await page.click(selector)
+                        await asyncio.sleep(1)
+                        break
+                except Exception:
+                    pass
 
-        # DOM Replacement: Search for matching dimensions and replace
-        injection_success = await page.evaluate("""
-            ({ width, height, html }) => {
-                const candidates = Array.from(document.querySelectorAll('div, iframe, ins'));
-                let target = null;
-                for (const el of candidates) {
-                    const rect = el.getBoundingClientRect();
-                    if (Math.abs(rect.width - width) <= 6 && Math.abs(rect.height - height) <= 6) {
-                        target = el;
-                        break;
-                    }
+            # Safe extraction of page summary
+            page_summary = await page.evaluate("""
+                () => {
+                    const title = document.title || '';
+                    const bodyText = (document.querySelector('article') || document.body || {}).innerText || '';
+                    return title + ' ' + bodyText.slice(0, 1500);
                 }
-                if (!target) return false;
+            """)
 
-                const wrapper = document.createElement('div');
-                wrapper.style.width = width + 'px';
-                wrapper.style.height = height + 'px';
-                wrapper.style.overflow = 'hidden';
-                wrapper.style.display = 'flex';
-                wrapper.style.alignItems = 'center';
-                wrapper.style.justifyContent = 'center';
-                wrapper.innerHTML = html;
+            # Search DOM for matching dimensions and replace
+            injection_success = await page.evaluate("""
+                ({ width, height, html }) => {
+                    const candidates = Array.from(document.querySelectorAll('div, iframe, ins'));
+                    let target = null;
+                    for (const el of candidates) {
+                        const rect = el.getBoundingClientRect();
+                        if (Math.abs(rect.width - width) <= 10 && Math.abs(rect.height - height) <= 10) {
+                            target = el;
+                            break;
+                        }
+                    }
+                    if (!target) return false;
 
-                target.innerHTML = '';
-                target.appendChild(wrapper);
-                target.scrollIntoView({ behavior: 'instant', block: 'center' });
-                return true;
-            }
-        """, {"width": w, "height": h, "html": creative_html})
+                    const wrapper = document.createElement('div');
+                    wrapper.style.width = width + 'px';
+                    wrapper.style.height = height + 'px';
+                    wrapper.style.overflow = 'hidden';
+                    wrapper.style.display = 'flex';
+                    wrapper.style.alignItems = 'center';
+                    wrapper.style.justifyContent = 'center';
+                    wrapper.innerHTML = html;
 
-        if not injection_success:
+                    target.innerHTML = '';
+                    target.appendChild(wrapper);
+                    target.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    return true;
+                }
+            """, {"width": w, "height": h, "html": creative_html})
+
+            if not injection_success:
+                await browser.close()
+                return None, page_summary, "No ad slot found matching dimensions on this page."
+
+            await asyncio.sleep(2)  # Wait for injected image to render
+            screenshot_bytes = await page.screenshot(full_page=False)
             await browser.close()
-            return None, page_summary, "No ad slot found matching dimensions."
+            return screenshot_bytes, page_summary, None
 
-        await asyncio.sleep(2) # Allow image/script to render
-        screenshot_bytes = await page.screenshot(full_page=False)
-        await browser.close()
-        return screenshot_bytes, page_summary, None
+        except Exception as e:
+            await browser.close()
+            return None, "", str(e)
 
 # Trigger Generation
 if st.button("Generate Proof of Performance", type="primary"):
@@ -129,24 +161,19 @@ if st.button("Generate Proof of Performance", type="primary"):
         with st.spinner("Processing tear sheet in cloud browser..."):
             client = genai.Client(api_key=gemini_key)
             
-            # Format creative payload
             if input_type == "Image URL":
                 formatted_creative = f'<img src="{creative_input}" style="width:{target_w}px;height:{target_h}px;object-fit:contain;display:block;margin:auto;" />'
             else:
                 formatted_creative = f'<iframe srcdoc="{creative_input}" width="{target_w}" height="{target_h}" frameborder="0" scrolling="no" style="border:none;overflow:hidden;"></iframe>'
 
-            # Run browser task
             screenshot_bytes, page_summary, err = asyncio.run(
-                capture_tear_sheet(page_url, target_w, target_h, formatted_creative, browserless_key)
+                capture_tear_sheet(page_url, target_w, target_h, formatted_creative, browserless_region, browserless_key)
             )
 
             if err:
                 st.error(f"Capture failed: {err}")
             else:
-                # 1. Brand Safety Evaluation
                 safety_result = evaluate_brand_safety(client, page_summary, brand_guidelines)
-                
-                # 2. Vision QA Inspection
                 vision_result = perform_vision_qa(client, screenshot_bytes, ad_size)
 
                 st.subheader("Result & Quality Check")
@@ -158,7 +185,6 @@ if st.button("Generate Proof of Performance", type="primary"):
 
                 st.image(screenshot_bytes, caption=f"Injected {ad_size} POP Screenshot", use_container_width=True)
                 
-                # Download Button
                 st.download_button(
                     label="Download POP Screenshot",
                     data=screenshot_bytes,
