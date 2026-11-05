@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 import io
-import base64
 from PIL import Image
 from google import genai
 
@@ -65,15 +64,12 @@ def perform_vision_qa(gemini_client, image_bytes, ad_size_str):
         return f"Vision QA skipped: {e}"
 
 def run_browserless_capture(url, w, h, creative_html, token):
-    # JavaScript mutation executed in the browser after page settles
-    # Uses safe query loops with dimension tolerance
     js_mutation = f"""
     (() => {{
         const width = {w};
         const height = {h};
         const adHtml = `{creative_html}`;
 
-        // Find candidate ad containers or iframes
         const elements = Array.from(document.querySelectorAll('div, iframe, ins, aside, [id*="ad"], [class*="ad"]'));
         let target = null;
         for (const el of elements) {{
@@ -101,7 +97,6 @@ def run_browserless_capture(url, w, h, creative_html, token):
     }})();
     """
 
-    # Browserless Screenshot REST API endpoint with stealth flags
     endpoint = f"https://production-sfo.browserless.io/screenshot?token={token}&stealth=true&blockAds=true"
 
     payload = {
@@ -137,7 +132,6 @@ def run_browserless_capture(url, w, h, creative_html, token):
         if response.status_code != 200:
             return None, "", f"Browserless error ({response.status_code}): {response.text}"
 
-        # Browserless /screenshot directly returns the PNG image binary
         screenshot_bytes = response.content
         return screenshot_bytes, "Page loaded and screenshot captured successfully.", None
 
@@ -153,10 +147,34 @@ if st.button("Generate Proof of Performance", type="primary"):
         with st.spinner("Capturing screenshot via Browserless hardened endpoint..."):
             client = genai.Client(api_key=gemini_key)
 
-            # Sanitize creative strings to prevent escaping issues in JavaScript template
             safe_creative = creative_input.replace("`", "\\`")
 
             if input_type == "Image URL":
                 formatted_creative = f'<img src="{safe_creative}" style="width:{target_w}px;height:{target_h}px;object-fit:contain;display:block;margin:auto;" />'
             else:
-                formatted_creative = f'<iframe srcdoc="{safe_creative}" width="{target_w}" height="{target_h}" frameborder="0" scrolling="no" style="border:none;overflow:hidden;">
+                formatted_creative = f'<iframe srcdoc="{safe_creative}" width="{target_w}" height="{target_h}" frameborder="0" scrolling="no" style="border:none;overflow:hidden;"></iframe>'
+
+            screenshot_bytes, page_text, err = run_browserless_capture(
+                page_url, target_w, target_h, formatted_creative, browserless_key
+            )
+
+            if err:
+                st.error(f"Capture failed: {err}")
+            else:
+                safety_result = evaluate_brand_safety(client, page_text, brand_guidelines)
+                vision_result = perform_vision_qa(client, screenshot_bytes, ad_size)
+
+                st.subheader("Result & Quality Check")
+                r1, r2 = st.columns(2)
+                with r1:
+                    st.info(f"**Brand Safety Check:**\n{safety_result}")
+                with r2:
+                    st.info(f"**Visual QA:**\n{vision_result}")
+
+                st.image(screenshot_bytes, caption=f"Injected {ad_size} POP Screenshot", use_container_width=True)
+                st.download_button(
+                    label="Download POP Screenshot",
+                    data=screenshot_bytes,
+                    file_name="proof_of_performance.png",
+                    mime="image/png"
+                )
