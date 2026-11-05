@@ -46,8 +46,9 @@ with st.sidebar:
     stealth = st.checkbox("Stealth mode", value=True)
     use_proxy = st.checkbox("Residential proxy (uses more Browserless units)", value=False)
     proxy_country = st.text_input("Proxy country (ISO code)", value="in", disabled=not use_proxy)
-    timeout_s = st.slider("Session timeout per site (sec)", 60, 600, 180, step=30,
-                          help="Free Browserless plans cap sessions at ~60 s - lower this if connections get rejected.")
+    timeout_s = st.slider("Session timeout per site (sec)", 30, 600, 120, step=10,
+                          help="Cannot exceed your Browserless plan's session limit (yours: 120 s). "
+                               "If Browserless rejects the value, the agent lowers it automatically.")
     concurrency = st.slider("Parallel sites", 1, 5, 1, help="Must not exceed your Browserless plan's concurrency.")
     tol = st.slider("Ad-size tolerance (px)", 0, 10, 3)
 
