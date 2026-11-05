@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import io
+import base64
 from PIL import Image
 from google import genai
 
@@ -64,12 +65,23 @@ def perform_vision_qa(gemini_client, image_bytes, ad_size_str):
         return f"Vision QA skipped: {e}"
 
 def run_browserless_capture(url, w, h, creative_html, token):
-    js_mutation = f"""
-    (() => {{
+    # Encode creative payload to avoid syntax errors inside the JavaScript string
+    b64_creative = base64.b64encode(creative_html.encode('utf-8')).decode('utf-8')
+
+    # Evaluates inside Browserless /scrape endpoint
+    scrape_script = f"""
+    new Promise(resolve => {{
         const width = {w};
         const height = {h};
-        const adHtml = `{creative_html}`;
+        const adHtml = decodeURIComponent(escape(atob('{b64_creative}')));
 
+        // Dismiss cookie banners if present
+        for (const sel of ["button:has-text('Accept')", "button:has-text('Agree')", "#onetrust-accept-btn-handler"]) {{
+            const btn = document.querySelector(sel);
+            if (btn) btn.click();
+        }}
+
+        // Locate matching ad container
         const elements = Array.from(document.querySelectorAll('div, iframe, ins, aside, [id*="ad"], [class*="ad"]'));
         let target = null;
         for (const el of elements) {{
@@ -80,45 +92,57 @@ def run_browserless_capture(url, w, h, creative_html, token):
             }}
         }}
 
+        let injected = false;
         if (target) {{
-            const container = document.createElement('div');
-            container.style.width = width + 'px';
-            container.style.height = height + 'px';
-            container.style.overflow = 'hidden';
-            container.style.display = 'flex';
-            container.style.alignItems = 'center';
-            container.style.justifyContent = 'center';
-            container.innerHTML = adHtml;
+            const wrapper = document.createElement('div');
+            wrapper.style.width = width + 'px';
+            wrapper.style.height = height + 'px';
+            wrapper.style.overflow = 'hidden';
+            wrapper.style.display = 'flex';
+            wrapper.style.alignItems = 'center';
+            wrapper.style.justifyContent = 'center';
+            wrapper.innerHTML = adHtml;
 
             target.innerHTML = '';
-            target.appendChild(container);
+            target.appendChild(wrapper);
             target.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+            injected = true;
         }}
-    }})();
+
+        const pageTitle = document.title || '';
+        const bodyText = (document.querySelector('article') || document.body || {{}}).innerText || '';
+        const summary = (pageTitle + ' ' + bodyText).slice(0, 1000);
+
+        setTimeout(() => {{
+            resolve({{ injected, summary }});
+        }}, 2000);
+    }})
     """
 
-    endpoint = f"https://production-sfo.browserless.io/screenshot?token={token}&stealth=true&blockAds=true"
+    endpoint = f"https://production-sfo.browserless.io/scrape?token={token}&stealth=true"
 
     payload = {
         "url": url,
-        "options": {
-            "type": "png",
-            "fullPage": False
+        "gotoOptions": {
+            "waitUntil": "domcontentloaded",
+            "timeout": 45000
         },
         "viewport": {
             "width": 1440,
             "height": 900
         },
-        "gotoOptions": {
-            "waitUntil": "domcontentloaded",
-            "timeout": 45000
-        },
         "waitForTimeout": 3000,
-        "scripts": [
+        "screenshot": {
+            "type": "png",
+            "fullPage": False
+        },
+        "elements": [
             {
-                "content": js_mutation
+                "selector": "body",
+                "timeout": 5000
             }
-        ]
+        ],
+        "eval": scrape_script
     }
 
     try:
@@ -132,8 +156,19 @@ def run_browserless_capture(url, w, h, creative_html, token):
         if response.status_code != 200:
             return None, "", f"Browserless error ({response.status_code}): {response.text}"
 
-        screenshot_bytes = response.content
-        return screenshot_bytes, "Page loaded and screenshot captured successfully.", None
+        res_data = response.json()
+        
+        # Extract screenshot data
+        screenshot_b64 = res_data.get("screenshot")
+        if not screenshot_b64:
+            return None, "", "No screenshot was returned by the browser session."
+
+        raw_bytes = base64.b64decode(screenshot_b64)
+
+        eval_result = res_data.get("eval", {})
+        page_summary = eval_result.get("summary", "")
+        
+        return raw_bytes, page_summary, None
 
     except requests.exceptions.RequestException as e:
         return None, "", f"Network connection error: {str(e)}"
@@ -144,15 +179,13 @@ if st.button("Generate Proof of Performance", type="primary"):
     elif not page_url or not creative_input:
         st.error("Please provide both the publisher URL and the creative tag/URL.")
     else:
-        with st.spinner("Capturing screenshot via Browserless hardened endpoint..."):
+        with st.spinner("Injecting ad and capturing tear sheet..."):
             client = genai.Client(api_key=gemini_key)
 
-            safe_creative = creative_input.replace("`", "\\`")
-
             if input_type == "Image URL":
-                formatted_creative = f'<img src="{safe_creative}" style="width:{target_w}px;height:{target_h}px;object-fit:contain;display:block;margin:auto;" />'
+                formatted_creative = f'<img src="{creative_input}" style="width:{target_w}px;height:{target_h}px;object-fit:contain;display:block;margin:auto;" />'
             else:
-                formatted_creative = f'<iframe srcdoc="{safe_creative}" width="{target_w}" height="{target_h}" frameborder="0" scrolling="no" style="border:none;overflow:hidden;"></iframe>'
+                formatted_creative = f'<iframe srcdoc="{creative_input}" width="{target_w}" height="{target_h}" frameborder="0" scrolling="no" style="border:none;overflow:hidden;"></iframe>'
 
             screenshot_bytes, page_text, err = run_browserless_capture(
                 page_url, target_w, target_h, formatted_creative, browserless_key
