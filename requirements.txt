@@ -1,0 +1,4 @@
+streamlit
+playwright
+google-genai
+Pillow
