@@ -767,7 +767,7 @@ async def new_context(browser, cfg: JobConfig):
 
 async def safe_goto(page, url: str, L: LogFn):
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         if "Timeout" in str(e):
             L("navigation is slow - continuing with the partially loaded page")
@@ -775,7 +775,7 @@ async def safe_goto(page, url: str, L: LogFn):
             raise
 
 
-async def lazy_scroll(page, cfg: JobConfig, steps: int = 6):
+async def lazy_scroll(page, cfg: JobConfig, steps: int = 4):
     try:
         total = await page.evaluate(
             "() => Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)"
@@ -783,19 +783,19 @@ async def lazy_scroll(page, cfg: JobConfig, steps: int = 6):
         for i in range(steps):
             y = min(int((i + 1) * cfg.viewport_h * 0.9), int(total))
             await page.evaluate("(y) => window.scrollTo(0, y)", y)
-            await page.wait_for_timeout(450)
+            await page.wait_for_timeout(350)
         await page.evaluate("() => window.scrollTo(0, 0)")
-        await page.wait_for_timeout(600)
+        await page.wait_for_timeout(500)
     except Exception:
         pass
 
 
 async def prepare_page(page, cfg: JobConfig, scroll: bool = True):
     try:
-        await page.wait_for_load_state("load", timeout=12000)
+        await page.wait_for_load_state("load", timeout=6000)
     except Exception:
         pass
-    await page.wait_for_timeout(1500)
+    await page.wait_for_timeout(1000)
     for _ in range(2):
         try:
             n = await page.evaluate(JS_DISMISS)
@@ -817,11 +817,15 @@ async def prepare_page(page, cfg: JobConfig, scroll: bool = True):
 # --------------------------------------------------------------------------------------
 
 
-async def pick_articles(page, cfg: JobConfig, gem: Optional[Gemini], site_url: str, L: LogFn) -> list[str]:
+async def get_links(page) -> list:
     try:
-        links = await page.evaluate(JS_LINKS)
+        return await page.evaluate(JS_LINKS)
     except Exception:
-        links = []
+        return []
+
+
+async def pick_articles(cfg: JobConfig, gem: Optional[Gemini], site_url: str, links: list, L: LogFn) -> list[str]:
+    """Choose candidate article URLs. Runs OUTSIDE any browser session (Gemini time is not billed as session time)."""
     if not links:
         L("no article links found - using the given URL")
         return [site_url]
@@ -861,8 +865,11 @@ async def pick_articles(page, cfg: JobConfig, gem: Optional[Gemini], site_url: s
     return urls or [site_url]
 
 
-async def check_brand_safety(page, cfg: JobConfig, gem: Gemini) -> dict:
-    info = await page.evaluate(JS_PAGE_TEXT)
+async def get_page_info(page) -> dict:
+    return await page.evaluate(JS_PAGE_TEXT)
+
+
+async def brand_safety_verdict(cfg: JobConfig, gem: Gemini, info: dict) -> dict:
     rules = cfg.brand_safety_rules.strip() or DEFAULT_BRAND_SAFETY_RULES
     prompt = (
         "You are a brand-safety reviewer for programmatic advertising. Decide whether it is SAFE to show a brand "
@@ -957,78 +964,90 @@ async def place_creative(page, cfg: JobConfig, gem: Optional[Gemini], c: Creativ
 
 # --------------------------------------------------------------------------------------
 # Per-site workflow
+#
+# A Browserless session has a hard time limit (your plan: 120 s). So the work is split:
+#   1. discovery session  (short)  : open the homepage, collect links, close.
+#   2. Gemini picks articles       : runs with NO browser session open.
+#   3. capture session(s)          : open ONE article, brand-safety check runs in parallel while
+#                                    the page prepares, then swap + screenshot every creative.
+#                                    If time runs low, a fresh session continues with the rest.
 # --------------------------------------------------------------------------------------
 
 
-async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site: str,
-                       creatives: list[Creative], out_dir: Path, log: LogFn) -> list[Result]:
-    site_url = normalize_url(site)
-    host = urlparse(site_url).netloc.replace("www.", "")
+async def close_quietly(browser):
+    try:
+        await browser.close()
+    except Exception:
+        pass
 
-    def L(msg: str):
-        log(f"[{idx}] {host}: {msg}")
 
-    rows: list[Result] = []
+async def discover_articles(pw, cfg: JobConfig, gem: Optional[Gemini], site_url: str, L: LogFn) -> list[str]:
     browser = await connect_with_retry(pw, cfg, L)
-    deadline = time.monotonic() + cfg.session_timeout_s - 10  # Browserless kills the session after the timeout
+    links: list = []
     try:
         ctx = await new_context(browser, cfg)
         page = await ctx.new_page()
-        L("opening page")
         await safe_goto(page, site_url, L)
+        await page.wait_for_timeout(2000)
+        links = await get_links(page)
+        if len(links) < 5:
+            await page.wait_for_timeout(2500)
+            links = await get_links(page)
+    finally:
+        await close_quietly(browser)
+    return await pick_articles(cfg, gem, site_url, links, L)
 
-        candidates = [site_url]
-        loaded = None
-        if cfg.find_latest_article:
-            await prepare_page(page, cfg, scroll=False)
-            candidates = await pick_articles(page, cfg, gem, site_url, L)
-        else:
-            await prepare_page(page, cfg, scroll=True)
-            loaded = site_url
 
-        chosen, notes = None, []
-        unchecked = False
-        out_of_time = False
-        for n, url in enumerate(candidates[: max(1, cfg.max_article_tries)]):
-            if n > 0 and deadline - time.monotonic() < 40:
-                L("session time budget low - stopping the article search")
-                out_of_time = True
-                break
-            if loaded != url:
-                L(f"opening {url}")
-                await safe_goto(page, url, L)
-                await prepare_page(page, cfg, scroll=True)
-                loaded = url
-            if cfg.brand_safety and gem:
-                verdict = await check_brand_safety(page, cfg, gem)
-                if verdict.get("unchecked"):
-                    unchecked = True
-                elif not verdict.get("safe", True):
-                    reason = f"{verdict.get('category', '')}: {verdict.get('reason', '')}"
-                    L(f"brand-safety FAIL ({reason}) - trying next article")
-                    notes.append(f"{url} -> {reason}")
-                    continue
-            chosen = url
-            break
+SESSION_DEAD = re.compile(r"closed|disconnected|connection|target page", re.I)
 
-        if not chosen:
-            rows.append(Result(index=idx, site=site_url, page_url=site_url, status="SKIPPED_BRAND_SAFETY",
-                               note=("ran out of Browserless session time; " if out_of_time else "")
-                               + ("; ".join(notes)[:300] or "no safe article found")))
-            return rows
 
-        article_url = page.url
-        L(f"capturing on {article_url}")
-        for k, c in enumerate(creatives, 1):
-            row = Result(index=idx, order=k, site=site_url, page_url=article_url,
-                         creative=c.name, size=f"{c.width}x{c.height}")
+async def capture_session(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, host: str, article_url: str,
+                          todo: list, out_dir: Path, L: LogFn, check_safety: bool) -> dict:
+    """One browser session on one article. todo = [(order, Creative), ...]."""
+    out = {"rows": [], "todo": list(todo), "unsafe": False, "reason": "", "unchecked": False}
+    browser = await connect_with_retry(pw, cfg, L)
+    deadline = time.monotonic() + cfg.session_timeout_s - 10  # Browserless kills the session at the limit
+    try:
+        ctx = await new_context(browser, cfg)
+        page = await ctx.new_page()
+        await safe_goto(page, article_url, L)
+        await page.wait_for_timeout(1200)
+
+        safety_task = None
+        if check_safety and gem:
+            try:
+                info = await get_page_info(page)
+                safety_task = asyncio.create_task(brand_safety_verdict(cfg, gem, info))
+            except Exception as e:
+                L(f"could not read page text for brand safety: {short(e)}")
+                out["unchecked"] = True
+
+        await prepare_page(page, cfg, scroll=True)  # Gemini works on the safety check meanwhile
+
+        if safety_task is not None:
+            try:
+                verdict = await asyncio.wait_for(safety_task, timeout=max(5.0, deadline - time.monotonic() - 30))
+            except Exception:
+                verdict = {"safe": True, "unchecked": True}
+            if verdict.get("unchecked"):
+                out["unchecked"] = True
+                L("brand safety could not be verified (continuing)")
+            elif not verdict.get("safe", True):
+                out["unsafe"] = True
+                out["reason"] = f"{verdict.get('category', '')}: {verdict.get('reason', '')}".strip()
+                L(f"brand-safety FAIL ({out['reason']})")
+                return out
+
+        shown_url = page.url
+        L(f"capturing on {shown_url}")
+        while out["todo"]:
+            k, c = out["todo"][0]
             remaining = deadline - time.monotonic()
             if remaining < 15:
-                row.status = "ERROR"
-                row.note = (f"Browserless session time limit ({cfg.session_timeout_s}s) reached before this creative - "
-                            "run fewer creatives per batch or use a plan with longer sessions")
-                rows.append(row)
-                continue
+                L("session time almost used up - continuing in a fresh session")
+                break
+            row = Result(index=idx, order=k, site=article_url, page_url=shown_url,
+                         creative=c.name, size=f"{c.width}x{c.height}")
             try:
                 placed = await place_creative(page, cfg, gem, c, L, allow_vision=remaining > 45)
                 if not placed:
@@ -1039,7 +1058,7 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
                     png = await page.screenshot(type="png", full_page=cfg.full_page, timeout=40000)
                     stamp = now_str(cfg.timezone)
                     if cfg.add_footer:
-                        png = add_footer(png, article_url, stamp, f"{c.width}x{c.height}", cfg.footer_label)
+                        png = add_footer(png, shown_url, stamp, f"{c.width}x{c.height}", cfg.footer_label)
                     fname = f"{idx:03d}_{safe_name(host)}_{c.width}x{c.height}_{k}.png"
                     (out_dir / fname).write_bytes(png)
                     row.status = "OK"
@@ -1047,19 +1066,77 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
                     row.file = str(out_dir / fname)
                     row.captured_at = stamp
                     row.note = f"matched via {placed.get('hints', '') or placed.get('method', '')}"
-                    if unchecked:
-                        row.note += " | brand safety NOT verified"
                     L(f"saved {fname}")
             except Exception as e:
+                if SESSION_DEAD.search(str(e)):
+                    L("browser session ended early - continuing in a fresh session")
+                    break
                 row.status = "ERROR"
                 row.note = short(e, cfg.browserless_token)
-            rows.append(row)
+            out["rows"].append(row)
+            out["todo"].pop(0)
+        return out
     finally:
-        try:
-            await browser.close()
-        except Exception:
-            pass
-    return rows
+        await close_quietly(browser)
+
+
+async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site: str,
+                       creatives: list[Creative], out_dir: Path, log: LogFn) -> list[Result]:
+    site_url = normalize_url(site)
+    host = urlparse(site_url).netloc.replace("www.", "")
+    t0 = time.monotonic()
+
+    def L(msg: str):
+        log(f"[{idx}] {host} +{int(time.monotonic() - t0)}s: {msg}")
+
+    if cfg.find_latest_article:
+        L("looking for the latest article")
+        candidates = await discover_articles(pw, cfg, gem, site_url, L)
+    else:
+        candidates = [site_url]
+
+    notes: list[str] = []
+    for url in candidates[: max(1, cfg.max_article_tries)]:
+        todo = list(enumerate(creatives, 1))
+        rows: list[Result] = []
+        unchecked = False
+        unsafe = False
+        sessions = 0
+        while todo and sessions < 4:
+            sessions += 1
+            try:
+                res = await capture_session(pw, cfg, gem, idx, host, url, todo, out_dir, L,
+                                            check_safety=(cfg.brand_safety and sessions == 1))
+            except Exception as e:
+                L(f"capture failed: {short(e, cfg.browserless_token)}")
+                for k, c in todo:
+                    rows.append(Result(index=idx, order=k, site=url, page_url=url, creative=c.name,
+                                       size=f"{c.width}x{c.height}", status="ERROR",
+                                       note=short(e, cfg.browserless_token)))
+                todo = []
+                break
+            if res["unsafe"]:
+                unsafe = True
+                notes.append(f"{url} -> {res['reason']}")
+                break
+            unchecked = unchecked or res["unchecked"]
+            rows += res["rows"]
+            todo = res["todo"]
+        if unsafe:
+            L("trying the next article")
+            continue
+        for k, c in todo:  # could not be finished within the available session time
+            rows.append(Result(index=idx, order=k, site=url, page_url=url, creative=c.name,
+                               size=f"{c.width}x{c.height}", status="ERROR",
+                               note=f"Not finished within {cfg.session_timeout_s}s browser sessions - rerun this site"))
+        if unchecked:
+            for r in rows:
+                if r.status == "OK":
+                    r.note += " | brand safety NOT verified"
+        return rows
+
+    return [Result(index=idx, site=site_url, page_url=site_url, status="SKIPPED_BRAND_SAFETY",
+                   note=("; ".join(notes))[:300] or "no safe article found")]
 
 
 async def run_job(cfg: JobConfig, sites: list[str], creatives: list[Creative], out_dir: Path,
