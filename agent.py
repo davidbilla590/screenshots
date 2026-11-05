@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import csv
+import hashlib
 import io
 import json
 import re
@@ -53,11 +54,14 @@ class Result:
     page_url: str = ""
     creative: str = ""
     size: str = ""
-    status: str = "PENDING"  # OK | NO_SLOT | SKIPPED_BRAND_SAFETY | ERROR
+    status: str = "PENDING"  # OK | QA_FAIL | NO_SLOT | SKIPPED_BRAND_SAFETY | ERROR
     method: str = ""
     note: str = ""
     file: str = ""
     captured_at: str = ""
+    qa_status: str = ""  # PASS | FAIL | NOT_RUN
+    qa_report: str = ""  # one line: failed checks (with reason) + passed checks
+    qa_fails: int = 0  # number of failed QA checks (used to pick the best fallback screenshot)
 
 
 @dataclass
@@ -79,13 +83,15 @@ class JobConfig:
     guidelines: str = ""
     brand_safety: bool = True
     brand_safety_rules: str = ""
-    max_article_tries: int = 3
+    max_article_tries: int = 5  # how many of the latest articles to search for a matching ad slot
     size_tolerance: int = 3
     use_vision_fallback: bool = True
     full_page: bool = False
     add_footer: bool = True
     footer_label: str = ""
     timezone: str = "Asia/Kolkata"
+    qa_enabled: bool = True  # Gemini vision QA of every screenshot (needs a Gemini key)
+    qa_extra_rules: str = ""  # optional extra QA rules appended to the 10 standard ones
 
 
 LogFn = Callable[[str], None]
@@ -378,7 +384,7 @@ class Gemini:
         self.model = model or "gemini-flash-latest"
         self.last_error = ""
 
-    def ask_json(self, prompt: str, image_png: Optional[bytes] = None):
+    def ask_json(self, prompt: str, image_png: Optional[bytes] = None, extra_images: Optional[list] = None):
         """Blocking call (run it with asyncio.to_thread). Returns parsed JSON or None."""
         import time
 
@@ -387,8 +393,8 @@ class Gemini:
         for attempt in range(2):
             try:
                 parts: list = []
-                if image_png:
-                    parts.append(types.Part.from_bytes(data=image_png, mime_type="image/png"))
+                for img in ([image_png] if image_png else []) + list(extra_images or []):
+                    parts.append(types.Part.from_bytes(data=img, mime_type="image/png"))
                 parts.append(prompt)
                 resp = self.client.models.generate_content(
                     model=self.model,
@@ -611,9 +617,14 @@ JS_REPLACE = (
   const tag = el.tagName.toLowerCase();
   if (tag === 'iframe' || tag === 'img') {
     box = document.createElement('div');
+    box.__popOrigEl = el;
     el.replaceWith(box);
-  } else if (box.__popMO) {
-    box.__popMO.disconnect();
+  } else {
+    if (box.__popMO) box.__popMO.disconnect();
+    if (!box.__popOrigNodes && !box.__popOrigEl) {
+      box.__popOrigNodes = Array.from(box.childNodes);
+      box.__popOrigStyle = box.getAttribute('style');
+    }
   }
   box.replaceChildren(node);
   box.removeAttribute('hidden');
@@ -650,12 +661,82 @@ JS_OVERLAY = (
   box.style.cssText = 'position:absolute!important;z-index:2147483647!important;overflow:hidden!important;margin:0!important;padding:0!important;' +
     'left:' + Math.max(0, left) + 'px!important;top:' + Math.max(0, top) + 'px!important;width:' + a.w + 'px!important;height:' + a.h + 'px!important;';
   box.setAttribute('data-pop-replaced', '1');
+  box.setAttribute('data-pop-overlay', '1');
   box.appendChild(node);
   document.documentElement.appendChild(box);
   return {ok: true};
 }
 """
 )
+
+JS_RESTORE = r"""
+() => {
+  let n = 0;
+  document.querySelectorAll('[data-pop-injected], [data-pop-overlay]').forEach((e) => { try { e.remove(); n++; } catch (x) {} });
+  document.querySelectorAll('[data-pop-replaced]').forEach((box) => {
+    try {
+      if (box.__popMO) { box.__popMO.disconnect(); box.__popMO = null; }
+      if (box.__popOrigEl) {
+        const o = box.__popOrigEl; box.__popOrigEl = null;
+        box.replaceWith(o);
+      } else if (box.__popOrigNodes) {
+        const nodes = box.__popOrigNodes; box.__popOrigNodes = null;
+        box.replaceChildren(...nodes);
+        const st = box.__popOrigStyle; box.__popOrigStyle = null;
+        if (st === null || st === undefined) box.removeAttribute('style'); else box.setAttribute('style', st);
+        box.removeAttribute('data-pop-replaced');
+      }
+      n++;
+    } catch (x) {}
+  });
+  document.querySelectorAll('[data-pop-cand]').forEach((e) => e.removeAttribute('data-pop-cand'));
+  return n;
+}
+"""
+
+# Reads back what is really on screen: is the creative fully visible, is something on top of it, is a video playing?
+JS_VERIFY = r"""
+async (tryPlay) => {
+  const el = document.querySelector('[data-pop-replaced]');
+  if (!el) return {found: false};
+  el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+  const vw = innerWidth, vh = innerHeight;
+  if (tryPlay) {
+    for (const v of document.querySelectorAll('video')) {
+      const b = v.getBoundingClientRect();
+      if (b.width < 120 || b.height < 70 || b.bottom < 0 || b.top > vh) continue;
+      if (!v.paused && !v.muted) continue;
+      try { v.muted = false; v.volume = 1; await v.play(); }
+      catch (e) { try { v.muted = true; await v.play(); } catch (e2) {} }
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  const r = el.getBoundingClientRect();
+  const ix = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+  const iy = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+  const area = r.width * r.height;
+  const visible = area ? (ix * iy) / area : 0;
+  let covered = 0, tested = 0;
+  for (const f of [[.5, .5], [.1, .1], [.9, .1], [.1, .9], [.9, .9]]) {
+    const x = r.left + r.width * f[0], y = r.top + r.height * f[1];
+    if (x < 0 || y < 0 || x >= vw || y >= vh) continue;
+    tested++;
+    const top = document.elementFromPoint(x, y);
+    if (top && top !== el && !el.contains(top)) covered++;
+  }
+  const videos = [];
+  document.querySelectorAll('video').forEach((v) => {
+    const b = v.getBoundingClientRect();
+    if (b.width < 120 || b.height < 70 || b.bottom < 0 || b.top > vh) return;
+    videos.push({paused: v.paused, muted: !!(v.muted || v.volume === 0), buffering: !v.paused && v.readyState < 3, ended: v.ended});
+  });
+  const embeds = document.querySelectorAll('iframe[src*="youtube"], iframe[src*="vimeo"], iframe[src*="dailymotion"]').length;
+  return {found: true, visible: visible, covered: covered, tested: tested,
+          rect: {x: r.left, y: r.top, w: r.width, h: r.height},
+          abs: {x: r.left + window.scrollX, y: r.top + window.scrollY},
+          videos: videos, embeds: embeds};
+}
+"""
 
 VISION_PROMPT = (
     "This is a screenshot of a web page. Detect every display-advertisement slot that is visible "
@@ -830,6 +911,7 @@ async def pick_articles(cfg: JobConfig, gem: Optional[Gemini], site_url: str, li
         L("no article links found - using the given URL")
         return [site_url]
     picks: list[int] = []
+    n_pick = max(5, min(10, int(cfg.max_article_tries)))
     if gem:
         listing = "\n".join(
             f"[{i}] {l['text']} | {urlparse(l['href']).path} | {l.get('date', '')}" for i, l in enumerate(links)
@@ -841,7 +923,7 @@ async def pick_articles(cfg: JobConfig, gem: Optional[Gemini], site_url: str, li
             "newest date when dates exist, otherwise the most prominent top-of-page stories.\n"
             f"Extra instructions from the campaign manager: {cfg.guidelines or 'none'}\n\n"
             f"{listing}\n\n"
-            'Return ONLY JSON: {"picks": [indices, best first, max 5]}'
+            f'Return ONLY JSON: {{"picks": [indices, newest/best first, max {n_pick}]}}'
         )
         data = await asyncio.to_thread(gem.ask_json, prompt)
         if isinstance(data, dict) and isinstance(data.get("picks"), list):
@@ -856,9 +938,17 @@ async def pick_articles(cfg: JobConfig, gem: Optional[Gemini], site_url: str, li
             L(f"Gemini article pick failed, using heuristic ({gem.last_error[:120]})")
     if not picks:
         slugged = [i for i, l in enumerate(links) if len([s for s in urlparse(l["href"]).path.split("/") if s]) >= 2]
-        picks = (slugged or list(range(len(links))))[:5]
+        picks = (slugged or list(range(len(links))))[:n_pick]
+    # Top up with the remaining article-like links so there are always enough articles to try if a slot is missing
+    if len(picks) < n_pick:
+        slugged = [i for i, l in enumerate(links) if len([s for s in urlparse(l["href"]).path.split("/") if s]) >= 2]
+        for i in slugged + list(range(len(links))):
+            if i not in picks:
+                picks.append(i)
+            if len(picks) >= n_pick:
+                break
     urls: list[str] = []
-    for i in picks[:5]:
+    for i in picks[:n_pick]:
         if links[i]["href"] not in urls:
             urls.append(links[i]["href"])
     L(f"article candidates: {len(urls)}")
@@ -963,6 +1053,219 @@ async def place_creative(page, cfg: JobConfig, gem: Optional[Gemini], c: Creativ
 
 
 # --------------------------------------------------------------------------------------
+# QA of the final screenshot (10 guidelines, judged by Gemini vision + DOM facts)
+# --------------------------------------------------------------------------------------
+
+QA_NAMES = {1: "Safety", 2: "Dates", 3: "Website", 4: "Creative", 5: "Layout", 6: "Authenticity",
+            7: "Quality", 8: "Popups", 9: "Video", 10: "Language"}
+
+QA_GUIDELINES = """\
+1. Safety: No crime, violence, sexual, alcohol, drugs, death, hate, or inappropriate/negative content.
+2. Dates: No past, expired, or outdated dates shown as current.
+3. Website: Looks safe, legitimate, and realistic; no suspicious or broken elements.
+4. Creative: Correct ad, branding, text, images, and CTA; no missing/cropped elements.
+5. Layout: Proper alignment, spacing, and sizing; no overlap or clipping.
+6. Authenticity: Looks like a genuine live website, not a mockup.
+7. Quality: Sharp, clear, clean, and high-quality; no visual artifacts.
+8. Popups: No unwanted popups, banners, alerts, or overlays.
+9. Video: If present, video must be playing and unmuted; not paused, muted, or buffering. Otherwise N/A.
+10. Language: If content is in a local language (e.g., Tagalog), translate/check it if needed. Flag only if the content is inappropriate, misleading, incorrect, or inconsistent with the screenshot. Otherwise LOOKS FINE.
+"""
+
+
+def _to_png(raw: bytes, max_side: int = 1400) -> Optional[bytes]:
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im.seek(0)
+        im = im.convert("RGB")
+        if max(im.size) > max_side:
+            im.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def crop_region(png: bytes, x: float, y: float, w: float, h: float, pad: int = 24, scale: int = 2) -> Optional[bytes]:
+    """2x close-up of the ad placement so Gemini can read the text / CTA and spot cropping."""
+    try:
+        im = Image.open(io.BytesIO(png)).convert("RGB")
+        box = (max(0, int(x - pad)), max(0, int(y - pad)), min(im.width, int(x + w + pad)), min(im.height, int(y + h + pad)))
+        if box[2] - box[0] < 10 or box[3] - box[1] < 10:
+            return None
+        c = im.crop(box)
+        c = c.resize((c.width * scale, c.height * scale), Image.LANCZOS)
+        buf = io.BytesIO()
+        c.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def parse_qa(data) -> Optional[dict]:
+    if not isinstance(data, dict) or not isinstance(data.get("checks"), list):
+        return None
+    checks: dict[int, tuple[str, str]] = {}
+    for it in data["checks"]:
+        try:
+            i = int(it.get("id"))
+        except Exception:
+            continue
+        if i not in QA_NAMES:
+            continue
+        st = str(it.get("status", "")).strip().upper()
+        if st in ("PASS", "OK", "LOOKS FINE", "YES"):
+            st = "PASS"
+        elif st in ("FAIL", "FAILED", "NO"):
+            st = "FAIL"
+        else:
+            st = "N/A"
+        checks[i] = (st, str(it.get("note", "")).replace("\n", " ")[:140])
+    if not checks:
+        return None
+    for i in QA_NAMES:
+        checks.setdefault(i, ("N/A", "not assessed"))
+    return {"checks": checks, "summary": str(data.get("summary", ""))[:200]}
+
+
+def apply_dom_facts(qa: dict, facts: dict, full_page: bool) -> None:
+    """Hard facts read from the page override the model: they are measured, not guessed."""
+    if not facts.get("found"):
+        return
+    if facts.get("covered"):
+        qa["checks"][5] = ("FAIL", "another element is drawn on top of the creative")
+    vis = facts.get("visible", 1)
+    if not full_page and vis < 0.95:
+        qa["checks"][4] = ("FAIL", f"only {int(vis * 100)}% of the creative is inside the screenshot")
+
+
+def finish_qa(qa: dict) -> dict:
+    qa["failed"] = sorted(i for i, (s, _) in qa["checks"].items() if s == "FAIL")
+    qa["status"] = "FAIL" if qa["failed"] else "PASS"
+    return qa
+
+
+def qa_report_text(qa: dict) -> str:
+    ch = qa["checks"]
+    parts = []
+    fails = [f"{i} {QA_NAMES[i]}: {ch[i][1] or 'failed'}" for i in sorted(ch) if ch[i][0] == "FAIL"]
+    if fails:
+        parts.append("FAILED -> " + " | ".join(fails))
+    passed = [QA_NAMES[i] for i in sorted(ch) if ch[i][0] == "PASS"]
+    parts.append("passed: " + (", ".join(passed) or "-"))
+    na = [QA_NAMES[i] for i in sorted(ch) if ch[i][0] == "N/A"]
+    if na:
+        parts.append("n/a: " + ", ".join(na))
+    if qa.get("summary"):
+        parts.append(qa["summary"])
+    return " ; ".join(parts)
+
+
+async def qa_review(cfg: JobConfig, gem: Gemini, c: Creative, png: bytes, facts: dict, info: dict,
+                    L: LogFn, timeout: float) -> Optional[dict]:
+    close = None
+    if facts.get("found"):
+        box = facts["abs"] if cfg.full_page else facts["rect"]
+        r = facts["rect"]
+        close = crop_region(png, box["x"], box["y"], r["w"], r["h"])
+    ref = _to_png(c.raw) if (c.kind == "image" and c.raw) else None
+    extra, desc = [], "Image 1 = the full screenshot of the page. "
+    n = 2
+    if close:
+        extra.append(close)
+        desc += f"Image {n} = 2x close-up of the ad placement. "
+        n += 1
+    if ref:
+        extra.append(ref)
+        desc += f"Image {n} = the ORIGINAL creative supplied by the client (what the ad must look like). "
+    else:
+        desc += "The creative is an HTML tag, so there is no reference file; judge it from the close-up. "
+    prompt = (
+        "You are a strict QA reviewer of ad-placement proof screenshots. The screenshot must show a real news/article "
+        "page with the client's banner placed on it.\n"
+        f"{desc}\n"
+        f"Today's date: {now_str(cfg.timezone)}\n"
+        f"Page URL: {info.get('url', '')}\nPage title: {info.get('title', '')}\nHeadline: {info.get('h1', '')}\n"
+        f"Page text excerpt: {(info.get('text') or '')[:1500]}\n"
+        f"Creative: {c.name}, expected size {c.width}x{c.height}\n"
+        f"Measured facts from the browser (reliable): creative visible {int(facts.get('visible', 0) * 100)}%, "
+        f"elements covering it: {facts.get('covered', 0)}, videos in view: {json.dumps(facts.get('videos', []))}, "
+        f"embedded video iframes: {facts.get('embeds', 0)}\n\n"
+        "Check the screenshot against these 10 guidelines:\n"
+        f"{QA_GUIDELINES}\n"
+        f"{('Extra rules: ' + cfg.qa_extra_rules.strip()) if cfg.qa_extra_rules.strip() else ''}\n"
+        "Judging notes:\n"
+        "- Judge only what is visible. FAIL means a clear violation, not a doubt.\n"
+        "- 1 and 3: also FAIL if the page is not an article (error/404, login wall, blank page, bare homepage).\n"
+        "- 2: FAIL only for dates that are expired or clearly outdated but presented as current (offers, events, 'today', "
+        "'live', news dated long ago). A normal recent publish date is fine.\n"
+        "- 4: compare against the original creative: same ad, branding, text, images and CTA, nothing missing or cropped.\n"
+        "- 9: status N/A if there is no video. Otherwise PASS only if it is playing and unmuted.\n"
+        "- 10: if the content is not English, translate it mentally. FAIL only if inappropriate, misleading, incorrect or "
+        "inconsistent with the screenshot, otherwise PASS (note 'LOOKS FINE').\n\n"
+        'Return ONLY JSON: {"checks":[{"id":1,"status":"PASS|FAIL|N/A","note":"<max 15 words>"}, ... ids 1 to 10 ...],'
+        '"summary":"<max 25 words>"}'
+    )
+    try:
+        data = await asyncio.wait_for(asyncio.to_thread(gem.ask_json, prompt, png, extra), timeout=timeout)
+    except Exception as e:
+        L(f"QA call failed: {short(e)}")
+        return None
+    qa = parse_qa(data)
+    if qa is None and gem.last_error:
+        L(f"QA unavailable ({gem.last_error[:100]})")
+    return qa
+
+
+async def verify_placement(page, try_play: bool = False) -> dict:
+    try:
+        return await page.evaluate(JS_VERIFY, bool(try_play)) or {}
+    except Exception:
+        return {}
+
+
+async def shoot_and_review(page, cfg: JobConfig, gem: Optional[Gemini], c: Creative, L: LogFn, deadline: float) -> dict:
+    """Screenshot + QA. If QA flags something fixable (popup, cropped/blurry render) it fixes it and retries once."""
+    png, qa, facts = b"", None, {}
+    for attempt in range(2):
+        facts = await verify_placement(page, try_play=True)
+        if facts.get("found") and (facts.get("covered") or (not cfg.full_page and facts.get("visible", 1) < 0.95)):
+            try:
+                await page.evaluate(JS_HIDE_OVERLAYS)
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
+            facts = await verify_placement(page)
+        png = await page.screenshot(type="png", full_page=cfg.full_page, timeout=40000)
+        qa = None
+        remaining = deadline - time.monotonic()
+        if cfg.qa_enabled and gem and remaining > 25:
+            try:
+                info = await get_page_info(page)
+            except Exception:
+                info = {"url": page.url}
+            qa = await qa_review(cfg, gem, c, png, facts, info, L, timeout=min(45.0, remaining - 12))
+            if qa:
+                apply_dom_facts(qa, facts, cfg.full_page)
+                finish_qa(qa)
+        if qa is None or qa["status"] == "PASS" or attempt == 1:
+            break
+        fixable = set(qa["failed"]) & {4, 5, 7, 8}
+        if not fixable or deadline - time.monotonic() < 40:
+            break
+        L("QA flagged " + ", ".join(QA_NAMES[i] for i in sorted(fixable)) + " - fixing and retrying once")
+        if 8 in fixable:
+            try:
+                await page.evaluate(JS_DISMISS)
+                await page.evaluate(JS_HIDE_OVERLAYS)
+            except Exception:
+                pass
+        await page.wait_for_timeout(1500)
+    return {"png": png, "qa": qa, "facts": facts}
+
+
+# --------------------------------------------------------------------------------------
 # Per-site workflow
 #
 # A Browserless session has a hard time limit (your plan: 120 s). So the work is split:
@@ -1003,7 +1306,8 @@ SESSION_DEAD = re.compile(r"closed|disconnected|connection|target page", re.I)
 
 async def capture_session(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, host: str, article_url: str,
                           todo: list, out_dir: Path, L: LogFn, check_safety: bool) -> dict:
-    """One browser session on one article. todo = [(order, Creative), ...]."""
+    """One browser session on one article. todo = [(order, Creative), ...].
+    Only a real ad slot of the creative's size is used (NO_SLOT if there is none) - nothing is ever created on the page."""
     out = {"rows": [], "todo": list(todo), "unsafe": False, "reason": "", "unchecked": False}
     browser = await connect_with_retry(pw, cfg, L)
     deadline = time.monotonic() + cfg.session_timeout_s - 10  # Browserless kills the session at the limit
@@ -1039,6 +1343,7 @@ async def capture_session(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, h
                 return out
 
         shown_url = page.url
+        tag = hashlib.md5(article_url.encode()).hexdigest()[:5]
         L(f"capturing on {shown_url}")
         while out["todo"]:
             k, c = out["todo"][0]
@@ -1049,24 +1354,45 @@ async def capture_session(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, h
             row = Result(index=idx, order=k, site=article_url, page_url=shown_url,
                          creative=c.name, size=f"{c.width}x{c.height}")
             try:
-                placed = await place_creative(page, cfg, gem, c, L, allow_vision=remaining > 45)
+                try:  # remove the banner of the previous creative so every screenshot shows ONE creative only
+                    await page.evaluate(JS_RESTORE)
+                except Exception:
+                    pass
+                placed = await place_creative(page, cfg, gem, c, L, allow_vision=(remaining > 45))
                 if not placed:
                     row.status = "NO_SLOT"
                     row.note = f"No {c.width}x{c.height} ad slot found on this page"
                 else:
                     await page.wait_for_timeout(900)
-                    png = await page.screenshot(type="png", full_page=cfg.full_page, timeout=40000)
+                    shot = await shoot_and_review(page, cfg, gem, c, L, deadline)
+                    png, qa, facts = shot["png"], shot["qa"], shot["facts"]
                     stamp = now_str(cfg.timezone)
                     if cfg.add_footer:
                         png = add_footer(png, shown_url, stamp, f"{c.width}x{c.height}", cfg.footer_label)
-                    fname = f"{idx:03d}_{safe_name(host)}_{c.width}x{c.height}_{k}.png"
+                    fname = f"{idx:03d}_{safe_name(host)}_{c.width}x{c.height}_{k}_{tag}.png"
                     (out_dir / fname).write_bytes(png)
-                    row.status = "OK"
                     row.method = placed.get("method", "")
                     row.file = str(out_dir / fname)
                     row.captured_at = stamp
                     row.note = f"matched via {placed.get('hints', '') or placed.get('method', '')}"
-                    L(f"saved {fname}")
+                    if qa is None:
+                        row.status, row.qa_status = "OK", "NOT_RUN"
+                        if not (cfg.qa_enabled and gem):
+                            row.note += " | QA not run (needs a Gemini key)"
+                        else:
+                            row.note += " | QA could not be completed"
+                    else:
+                        row.qa_report = qa_report_text(qa)
+                        row.qa_fails = len(qa["failed"])
+                        if qa["status"] == "PASS":
+                            row.status, row.qa_status = "OK", "PASS"
+                        else:
+                            row.status, row.qa_status = "QA_FAIL", "FAIL"
+                            L("QA FAIL: " + ", ".join(QA_NAMES[i] for i in qa["failed"]))
+                    if qa is not None and qa["status"] == "PASS":
+                        L(f"saved {fname} (QA pass)")
+                    else:
+                        L(f"saved {fname}")
             except Exception as e:
                 if SESSION_DEAD.search(str(e)):
                     L("browser session ended early - continuing in a fresh session")
@@ -1080,8 +1406,45 @@ async def capture_session(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, h
         await close_quietly(browser)
 
 
+async def run_url(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, host: str, url: str, todo: list,
+                  out_dir: Path, L: LogFn, check_safety: bool):
+    """All pending creatives on ONE article (several browser sessions if the time limit requires it)."""
+    rows: list[Result] = []
+    todo = list(todo)
+    unsafe, reason, unchecked, sessions = False, "", False, 0
+    while todo and sessions < 4:
+        sessions += 1
+        try:
+            res = await capture_session(pw, cfg, gem, idx, host, url, todo, out_dir, L,
+                                        check_safety=(check_safety and sessions == 1))
+        except Exception as e:
+            L(f"capture failed: {short(e, cfg.browserless_token)}")
+            for k, c in todo:
+                rows.append(Result(index=idx, order=k, site=url, page_url=url, creative=c.name,
+                                   size=f"{c.width}x{c.height}", status="ERROR", note=short(e, cfg.browserless_token)))
+            todo = []
+            break
+        if res["unsafe"]:
+            unsafe, reason = True, res["reason"]
+            break
+        unchecked = unchecked or res["unchecked"]
+        rows += res["rows"]
+        todo = res["todo"]
+    if not unsafe:
+        for k, c in todo:  # could not be finished within the available session time
+            rows.append(Result(index=idx, order=k, site=url, page_url=url, creative=c.name,
+                               size=f"{c.width}x{c.height}", status="ERROR",
+                               note=f"Not finished within {cfg.session_timeout_s}s browser sessions - rerun this site"))
+    return rows, unsafe, reason, unchecked
+
+
 async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site: str,
                        creatives: list[Creative], out_dir: Path, log: LogFn) -> list[Result]:
+    """
+    For every creative the agent walks through the latest articles until it gets a screenshot that passes QA:
+      each of the latest articles, real ad slot only (next article if no slot / QA fails / error)
+    A creative with no real slot on any checked article gets NO_SLOT and NO screenshot.
+    """
     site_url = normalize_url(site)
     host = urlparse(site_url).netloc.replace("www.", "")
     t0 = time.monotonic()
@@ -1090,53 +1453,80 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
         log(f"[{idx}] {host} +{int(time.monotonic() - t0)}s: {msg}")
 
     if cfg.find_latest_article:
-        L("looking for the latest article")
+        L("looking for the latest articles")
         candidates = await discover_articles(pw, cfg, gem, site_url, L)
     else:
         candidates = [site_url]
+    candidates = candidates[: max(1, cfg.max_article_tries)]
 
+    accepted: dict[int, Result] = {}  # creative order -> screenshot that passed
+    fallback: dict[int, Result] = {}  # creative order -> best screenshot that failed QA
+    problem: dict[int, Result] = {}  # creative order -> last NO_SLOT / ERROR row
+    all_files: set[str] = set()
+    safe_urls: list[str] = []
     notes: list[str] = []
-    for url in candidates[: max(1, cfg.max_article_tries)]:
-        todo = list(enumerate(creatives, 1))
-        rows: list[Result] = []
-        unchecked = False
-        unsafe = False
-        sessions = 0
-        while todo and sessions < 4:
-            sessions += 1
-            try:
-                res = await capture_session(pw, cfg, gem, idx, host, url, todo, out_dir, L,
-                                            check_safety=(cfg.brand_safety and sessions == 1))
-            except Exception as e:
-                L(f"capture failed: {short(e, cfg.browserless_token)}")
-                for k, c in todo:
-                    rows.append(Result(index=idx, order=k, site=url, page_url=url, creative=c.name,
-                                       size=f"{c.width}x{c.height}", status="ERROR",
-                                       note=short(e, cfg.browserless_token)))
-                todo = []
-                break
-            if res["unsafe"]:
-                unsafe = True
-                notes.append(f"{url} -> {res['reason']}")
-                break
-            unchecked = unchecked or res["unchecked"]
-            rows += res["rows"]
-            todo = res["todo"]
-        if unsafe:
-            L("trying the next article")
-            continue
-        for k, c in todo:  # could not be finished within the available session time
-            rows.append(Result(index=idx, order=k, site=url, page_url=url, creative=c.name,
-                               size=f"{c.width}x{c.height}", status="ERROR",
-                               note=f"Not finished within {cfg.session_timeout_s}s browser sessions - rerun this site"))
-        if unchecked:
-            for r in rows:
-                if r.status == "OK":
-                    r.note += " | brand safety NOT verified"
-        return rows
+    unchecked = False
+    pending = list(enumerate(creatives, 1))
 
-    return [Result(index=idx, site=site_url, page_url=site_url, status="SKIPPED_BRAND_SAFETY",
-                   note=("; ".join(notes))[:300] or "no safe article found")]
+    def absorb(rows: list[Result]):
+        for r in rows:
+            if r.file:
+                all_files.add(r.file)
+            if r.status == "OK":
+                accepted.setdefault(r.order, r)
+            elif r.status == "QA_FAIL":
+                cur = fallback.get(r.order)
+                if cur is None or r.qa_fails < cur.qa_fails:
+                    fallback[r.order] = r
+            else:
+                problem[r.order] = r
+
+    # ---- natural slots, article by article --------------------------------------------------------------------
+    for n, url in enumerate(candidates, 1):
+        if not pending:
+            break
+        rows, unsafe, reason, unc = await run_url(pw, cfg, gem, idx, host, url, pending, out_dir, L,
+                                                  check_safety=cfg.brand_safety)
+        if unsafe:
+            notes.append(f"{url} -> {reason}")
+            L(f"article {n}/{len(candidates)} not brand-safe - trying the next article")
+            continue
+        unchecked = unchecked or unc
+        safe_urls.append(url)
+        absorb(rows)
+        pending = [(k, c) for k, c in pending if k not in accepted]
+        if pending:
+            L(f"article {n}/{len(candidates)}: {len(pending)} creative(s) still without a passing screenshot"
+              + (" - trying the next article" if n < len(candidates) else ""))
+
+    if not safe_urls:
+        return [Result(index=idx, site=site_url, page_url=site_url, status="SKIPPED_BRAND_SAFETY",
+                       note=("; ".join(notes))[:300] or "no safe article found")]
+
+    # ---- final rows ------------------------------------------------------------------------------------------------
+    final: list[Result] = []
+    for k, c in enumerate(creatives, 1):
+        r = accepted.get(k) or fallback.get(k)
+        if r is None:
+            r = problem.get(k) or Result(index=idx, order=k, site=site_url, page_url=site_url, creative=c.name,
+                                         size=f"{c.width}x{c.height}", status="ERROR", note="not processed")
+            if r.status == "NO_SLOT":
+                r.note = f"No {c.width}x{c.height} ad slot on any of the {len(safe_urls)} latest article(s) checked"
+        final.append(r)
+
+    keep = {r.file for r in final if r.file}
+    for f in all_files - keep:  # screenshots of rejected attempts
+        try:
+            Path(f).unlink()
+        except Exception:
+            pass
+    if unchecked:
+        for r in final:
+            if r.file:
+                r.note += " | brand safety NOT verified"
+    ok = sum(1 for r in final if r.status == "OK")
+    L(f"done: {ok}/{len(final)} screenshot(s) passed QA, {sum(1 for r in final if r.status == 'QA_FAIL')} flagged by QA")
+    return final
 
 
 async def run_job(cfg: JobConfig, sites: list[str], creatives: list[Creative], out_dir: Path,
@@ -1188,7 +1578,8 @@ def run_job_sync(*args, **kwargs) -> list[Result]:
 
 def build_outputs(results: list[Result], out_dir: Path) -> tuple[bytes, bytes]:
     """Write report.csv + a ZIP of all screenshots. Returns (zip_bytes, csv_bytes)."""
-    fields = ["index", "site", "page_url", "creative", "size", "status", "method", "captured_at", "file", "note"]
+    fields = ["index", "site", "page_url", "creative", "size", "status", "qa_status", "qa_report", "method",
+              "captured_at", "file", "note"]
     csv_path = out_dir / "report.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
