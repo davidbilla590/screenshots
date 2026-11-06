@@ -74,7 +74,9 @@ class JobConfig:
     residential_proxy: bool = False
     proxy_country: str = "in"
     session_timeout_s: int = 180
-    concurrency: int = 1
+    concurrency: int = 0  # publisher URLs processed in parallel; 0 = ALL of them at once
+    site_timeout_s: int = 900  # hard limit per publisher URL; on timeout the screenshots already captured are kept
+    brand_safety_fallback: bool = True  # no suitable article found -> use the brand-safety-flagged ones (flagged in note + QA)
     mobile: bool = False
     viewport_w: int = 1366
     viewport_h: int = 768
@@ -808,12 +810,18 @@ async def connect_with_retry(pw, cfg: JobConfig, L: LogFn):
     last = None
     attempt = 0
     clamped = False
-    while attempt < 3:
+    busy = False
+    while attempt < (8 if busy else 3):
         attempt += 1
         try:
             return await pw.chromium.connect_over_cdp(ws_url(cfg), timeout=45000)
         except Exception as e:
             last = e
+            if re.search(r"429|too many|concurren|queue|busy", str(e), re.I):
+                busy = True  # all Browserless slots in use (many sites in parallel): wait for a free one
+                L(f"Browserless is busy - waiting for a free session (attempt {attempt}/8)")
+                await asyncio.sleep(min(30, 6 * attempt))
+                continue
             # Browserless rejects a timeout above the plan limit: "...between 1 and 120,000..."
             m = re.search(r"between 1 and ([\d,]+)", str(e))
             if m and not clamped:
@@ -1478,7 +1486,7 @@ def article_key(u: str) -> str:
 
 async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site: str,
                        creatives: list[Creative], out_dir: Path, log: LogFn,
-                       used_articles: Optional[set] = None) -> list[Result]:
+                       used_articles: Optional[set] = None, sink: Optional[list] = None) -> list[Result]:
     """
     For every creative the agent walks through the latest articles until it gets a screenshot that passes QA:
       walk through the site's articles, real ad slot only (next article if no slot / QA fails / error)
@@ -1511,6 +1519,7 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
     problem: dict[int, Result] = {}  # creative order -> last NO_SLOT / ERROR row
     all_files: set[str] = set()
     safe_urls: list[str] = []
+    unsafe_urls: dict[str, str] = {}  # article url -> brand-safety reason
     notes: list[str] = []
     unchecked = False
     pending = list(enumerate(creatives, 1))
@@ -1519,6 +1528,8 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
         for r in rows:
             if r.file:
                 all_files.add(r.file)
+            if sink is not None and r.status in ("OK", "QA_FAIL"):
+                sink.append(r)  # lets run_job keep finished screenshots if this site hits its time limit
             if r.status == "OK":
                 accepted.setdefault(r.order, r)
             elif r.status == "QA_FAIL":
@@ -1538,6 +1549,7 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
                                                   check_safety=cfg.brand_safety)
         if unsafe:
             notes.append(f"{url} -> {reason}")
+            unsafe_urls[url] = reason
             L(f"article {n}/{len(candidates)} not brand-safe - trying the next article")
             continue
         unchecked = unchecked or unc
@@ -1550,9 +1562,28 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
             L(f"article {n}/{len(candidates)}: {len(pending)} creative(s) still without a passing screenshot"
               + (" - trying the next article" if n < len(candidates) else ""))
 
-    if not safe_urls:
+    # ---- no suitable article: ignore brand safety and use the articles that were only skipped for that reason --------
+    used_unsafe: dict[str, str] = {}
+    if pending and unsafe_urls and cfg.brand_safety_fallback:
+        L(f"{len(pending)} creative(s) found no suitable brand-safe article - ignoring brand safety for the skipped articles")
+        for url, reason in unsafe_urls.items():
+            if not pending:
+                break
+            if article_key(url) in used:
+                continue
+            rows, _, _, _ = await run_url(pw, cfg, gem, idx, host, url, pending, out_dir, L, check_safety=False)
+            for r in rows:
+                if r.status in ("OK", "QA_FAIL"):
+                    used_unsafe[r.site] = reason
+            absorb(rows)
+            if any(r.status == "OK" for r in rows):
+                used.add(article_key(url))
+            pending = [(k, c) for k, c in pending if k not in accepted]
+
+    if not (accepted or fallback or problem):
         return [Result(index=idx, site=site_url, page_url=site_url, status="SKIPPED_BRAND_SAFETY",
                        note=("; ".join(notes))[:300] or "no safe article found")]
+    checked = len(safe_urls) + len(used_unsafe)
 
     # ---- final rows ------------------------------------------------------------------------------------------------
     final: list[Result] = []
@@ -1566,7 +1597,7 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
             r = problem.get(k) or Result(index=idx, order=k, site=site_url, page_url=site_url, creative=c.name,
                                          size=f"{c.width}x{c.height}", status="ERROR", note="not processed")
             if r.status == "NO_SLOT":
-                r.note = f"No {c.width}x{c.height} ad slot on any of the {len(safe_urls)} latest article(s) checked"
+                r.note = f"No {c.width}x{c.height} ad slot on any of the {max(checked, 1)} latest article(s) checked"
         final.append(r)
 
     keep = {r.file for r in final if r.file}
@@ -1575,6 +1606,9 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
             Path(f).unlink()
         except Exception:
             pass
+    for r in final:
+        if r.file and r.site in used_unsafe:
+            r.note += f" | brand-safety flagged ({used_unsafe[r.site][:90]}) - used because no other suitable article was found"
     if unchecked:
         for r in final:
             if r.file:
@@ -1599,7 +1633,7 @@ async def run_job(cfg: JobConfig, sites: list[str], creatives: list[Creative], o
     else:
         log("No Gemini key - using heuristics only (no brand-safety check, no vision fallback)")
 
-    sem = asyncio.Semaphore(max(1, int(cfg.concurrency)))
+    sem = asyncio.Semaphore(max(1, int(cfg.concurrency) if int(cfg.concurrency) > 0 else len(sites)))  # 0 = all at once
     results: list[Result] = []
     done = 0
     used_by_host: dict[str, set] = {}  # articles already screenshotted, per website (shared by all rows of the job)
@@ -1612,9 +1646,24 @@ async def run_job(cfg: JobConfig, sites: list[str], creatives: list[Creative], o
             hkey = urlparse(normalize_url(site)).netloc.replace("www.", "").lower()
             lock = host_locks.setdefault(hkey, asyncio.Lock())  # rows of the same website run one after another
             async with sem, lock:
+                sink: list[Result] = []
                 try:
-                    rows = await process_site(pw, cfg, gem, i, site, creatives, out_dir, log,
-                                              used_articles=used_by_host.setdefault(hkey, set()))
+                    rows = await asyncio.wait_for(
+                        process_site(pw, cfg, gem, i, site, creatives, out_dir, log,
+                                     used_articles=used_by_host.setdefault(hkey, set()), sink=sink),
+                        timeout=max(10, int(cfg.site_timeout_s)))
+                except asyncio.TimeoutError:
+                    log(f"[{i}] {site}: time limit of {cfg.site_timeout_s}s reached - keeping what was captured")
+                    best: dict[int, Result] = {}
+                    for r in sink:
+                        cur = best.get(r.order)
+                        if cur is None or (r.status == "OK" and cur.status != "OK") or (
+                                r.status == cur.status and r.qa_fails < cur.qa_fails):
+                            best[r.order] = r
+                    rows = [best.get(k) or Result(
+                        index=i, order=k, site=site, creative=c.name, size=f"{c.width}x{c.height}", status="ERROR",
+                        note=f"Timed out after {cfg.site_timeout_s}s - rerun this site or lower max_article_tries")
+                        for k, c in enumerate(creatives, 1)]
                 except Exception as e:
                     log(f"[{i}] {site}: ERROR {short(e, cfg.browserless_token)}")
                     rows = [Result(index=i, site=site, status="ERROR", note=short(e, cfg.browserless_token))]
