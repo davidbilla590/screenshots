@@ -90,6 +90,7 @@ class JobConfig:
     add_footer: bool = True
     footer_label: str = ""
     timezone: str = "Asia/Kolkata"
+    min_content_pct: int = 60  # screenshot must show real page content over at least this % of its area
     qa_enabled: bool = True  # Gemini vision QA of every screenshot (needs a Gemini key)
     qa_extra_rules: str = ""  # optional extra QA rules appended to the 10 standard ones
 
@@ -905,13 +906,13 @@ async def get_links(page) -> list:
         return []
 
 
-async def pick_articles(cfg: JobConfig, gem: Optional[Gemini], site_url: str, links: list, L: LogFn) -> list[str]:
+async def pick_articles(cfg: JobConfig, gem: Optional[Gemini], site_url: str, links: list, L: LogFn, want: int = 10) -> list[str]:
     """Choose candidate article URLs. Runs OUTSIDE any browser session (Gemini time is not billed as session time)."""
     if not links:
         L("no article links found - using the given URL")
         return [site_url]
     picks: list[int] = []
-    n_pick = max(5, min(10, int(cfg.max_article_tries)))
+    n_pick = max(5, min(30, int(want)))
     if gem:
         listing = "\n".join(
             f"[{i}] {l['text']} | {urlparse(l['href']).path} | {l.get('date', '')}" for i, l in enumerate(links)
@@ -1057,7 +1058,7 @@ async def place_creative(page, cfg: JobConfig, gem: Optional[Gemini], c: Creativ
 # --------------------------------------------------------------------------------------
 
 QA_NAMES = {1: "Safety", 2: "Dates", 3: "Website", 4: "Creative", 5: "Layout", 6: "Authenticity",
-            7: "Quality", 8: "Popups", 9: "Video", 10: "Language"}
+            7: "Quality", 8: "Popups", 9: "Video", 10: "Language", 11: "Content"}
 
 QA_GUIDELINES = """\
 1. Safety: No crime, violence, sexual, alcohol, drugs, death, hate, or inappropriate/negative content.
@@ -1070,6 +1071,7 @@ QA_GUIDELINES = """\
 8. Popups: No unwanted popups, banners, alerts, or overlays.
 9. Video: If present, video must be playing and unmuted; not paused, muted, or buffering. Otherwise N/A.
 10. Language: If content is in a local language (e.g., Tagalog), translate/check it if needed. Flag only if the content is inappropriate, misleading, incorrect, or inconsistent with the screenshot. Otherwise LOOKS FINE.
+11. Content: The screenshot must show real page content (headline, article text, images) over at least 60-70% of its area - not a mostly blank, empty, still-loading or error page.
 """
 
 
@@ -1103,6 +1105,21 @@ def crop_region(png: bytes, x: float, y: float, w: float, h: float, pad: int = 2
         return None
 
 
+def content_coverage(png: bytes, cell: int = 20) -> float:
+    """% of the screenshot (in 20px cells) that holds something other than the plain page background."""
+    try:
+        from PIL import ImageChops
+        im = Image.open(io.BytesIO(png)).convert("L")
+        hist = im.histogram()
+        bg = max(range(256), key=lambda v: hist[v])
+        mask = ImageChops.difference(im, Image.new("L", im.size, bg)).point(lambda v: 255 if v > 24 else 0)
+        small = mask.resize((max(1, im.width // cell), max(1, im.height // cell)), Image.BOX)
+        px = list(small.getdata())
+        return round(100.0 * sum(1 for v in px if v > 10) / max(1, len(px)), 1)
+    except Exception:
+        return 100.0
+
+
 def parse_qa(data) -> Optional[dict]:
     if not isinstance(data, dict) or not isinstance(data.get("checks"), list):
         return None
@@ -1129,8 +1146,11 @@ def parse_qa(data) -> Optional[dict]:
     return {"checks": checks, "summary": str(data.get("summary", ""))[:200]}
 
 
-def apply_dom_facts(qa: dict, facts: dict, full_page: bool) -> None:
+def apply_dom_facts(qa: dict, facts: dict, full_page: bool, min_content: float = 60.0) -> None:
     """Hard facts read from the page override the model: they are measured, not guessed."""
+    cp = facts.get("content_pct")
+    if cp is not None and cp < min_content:
+        qa["checks"][11] = ("FAIL", f"only {cp:.0f}% of the screenshot shows page content (need {min_content:.0f}%+)")
     if not facts.get("found"):
         return
     if facts.get("covered"):
@@ -1191,8 +1211,9 @@ async def qa_review(cfg: JobConfig, gem: Gemini, c: Creative, png: bytes, facts:
         f"Creative: {c.name}, expected size {c.width}x{c.height}\n"
         f"Measured facts from the browser (reliable): creative visible {int(facts.get('visible', 0) * 100)}%, "
         f"elements covering it: {facts.get('covered', 0)}, videos in view: {json.dumps(facts.get('videos', []))}, "
-        f"embedded video iframes: {facts.get('embeds', 0)}\n\n"
-        "Check the screenshot against these 10 guidelines:\n"
+        f"embedded video iframes: {facts.get('embeds', 0)}, "
+        f"measured page-content coverage: {facts.get('content_pct', '?')}% (minimum {cfg.min_content_pct}%)\n\n"
+        "Check the screenshot against these 11 guidelines:\n"
         f"{QA_GUIDELINES}\n"
         f"{('Extra rules: ' + cfg.qa_extra_rules.strip()) if cfg.qa_extra_rules.strip() else ''}\n"
         "Judging notes:\n"
@@ -1202,9 +1223,11 @@ async def qa_review(cfg: JobConfig, gem: Gemini, c: Creative, png: bytes, facts:
         "'live', news dated long ago). A normal recent publish date is fine.\n"
         "- 4: compare against the original creative: same ad, branding, text, images and CTA, nothing missing or cropped.\n"
         "- 9: status N/A if there is no video. Otherwise PASS only if it is playing and unmuted.\n"
+        "- 11: FAIL if real page content covers clearly less than the minimum % of the screenshot (mostly blank/white, skeleton "
+        "loaders, error page).\n"
         "- 10: if the content is not English, translate it mentally. FAIL only if inappropriate, misleading, incorrect or "
         "inconsistent with the screenshot, otherwise PASS (note 'LOOKS FINE').\n\n"
-        'Return ONLY JSON: {"checks":[{"id":1,"status":"PASS|FAIL|N/A","note":"<max 15 words>"}, ... ids 1 to 10 ...],'
+        'Return ONLY JSON: {"checks":[{"id":1,"status":"PASS|FAIL|N/A","note":"<max 15 words>"}, ... ids 1 to 11 ...],'
         '"summary":"<max 25 words>"}'
     )
     try:
@@ -1238,6 +1261,7 @@ async def shoot_and_review(page, cfg: JobConfig, gem: Optional[Gemini], c: Creat
             await page.wait_for_timeout(500)
             facts = await verify_placement(page)
         png = await page.screenshot(type="png", full_page=cfg.full_page, timeout=40000)
+        facts["content_pct"] = content_coverage(png)
         qa = None
         remaining = deadline - time.monotonic()
         if cfg.qa_enabled and gem and remaining > 25:
@@ -1247,11 +1271,15 @@ async def shoot_and_review(page, cfg: JobConfig, gem: Optional[Gemini], c: Creat
                 info = {"url": page.url}
             qa = await qa_review(cfg, gem, c, png, facts, info, L, timeout=min(45.0, remaining - 12))
             if qa:
-                apply_dom_facts(qa, facts, cfg.full_page)
+                apply_dom_facts(qa, facts, cfg.full_page, cfg.min_content_pct)
                 finish_qa(qa)
+        if qa is None and facts["content_pct"] < cfg.min_content_pct:  # content rule is measured, needs no AI
+            qa = {"checks": {i: ("N/A", "AI QA not run") for i in QA_NAMES}, "summary": ""}
+            apply_dom_facts(qa, facts, cfg.full_page, cfg.min_content_pct)
+            finish_qa(qa)
         if qa is None or qa["status"] == "PASS" or attempt == 1:
             break
-        fixable = set(qa["failed"]) & {4, 5, 7, 8}
+        fixable = set(qa["failed"]) & {4, 5, 7, 8, 11}
         if not fixable or deadline - time.monotonic() < 40:
             break
         L("QA flagged " + ", ".join(QA_NAMES[i] for i in sorted(fixable)) + " - fixing and retrying once")
@@ -1284,7 +1312,7 @@ async def close_quietly(browser):
         pass
 
 
-async def discover_articles(pw, cfg: JobConfig, gem: Optional[Gemini], site_url: str, L: LogFn) -> list[str]:
+async def discover_articles(pw, cfg: JobConfig, gem: Optional[Gemini], site_url: str, L: LogFn, want: int = 10) -> list[str]:
     browser = await connect_with_retry(pw, cfg, L)
     links: list = []
     try:
@@ -1298,7 +1326,7 @@ async def discover_articles(pw, cfg: JobConfig, gem: Optional[Gemini], site_url:
             links = await get_links(page)
     finally:
         await close_quietly(browser)
-    return await pick_articles(cfg, gem, site_url, links, L)
+    return await pick_articles(cfg, gem, site_url, links, L, want)
 
 
 SESSION_DEAD = re.compile(r"closed|disconnected|connection|target page", re.I)
@@ -1308,7 +1336,7 @@ async def capture_session(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, h
                           todo: list, out_dir: Path, L: LogFn, check_safety: bool) -> dict:
     """One browser session on one article. todo = [(order, Creative), ...].
     Only a real ad slot of the creative's size is used (NO_SLOT if there is none) - nothing is ever created on the page."""
-    out = {"rows": [], "todo": list(todo), "unsafe": False, "reason": "", "unchecked": False}
+    out = {"rows": [], "todo": list(todo), "unsafe": False, "reason": "", "unchecked": False, "stop": False}
     browser = await connect_with_retry(pw, cfg, L)
     deadline = time.monotonic() + cfg.session_timeout_s - 10  # Browserless kills the session at the limit
     try:
@@ -1401,6 +1429,9 @@ async def capture_session(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, h
                 row.note = short(e, cfg.browserless_token)
             out["rows"].append(row)
             out["todo"].pop(0)
+            if row.status == "OK":  # this article is now used: every other creative must go to a DIFFERENT article
+                out["stop"] = True
+                break
         return out
     finally:
         await close_quietly(browser)
@@ -1411,7 +1442,7 @@ async def run_url(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, host: str
     """All pending creatives on ONE article (several browser sessions if the time limit requires it)."""
     rows: list[Result] = []
     todo = list(todo)
-    unsafe, reason, unchecked, sessions = False, "", False, 0
+    unsafe, reason, unchecked, sessions, stopped = False, "", False, 0, False
     while todo and sessions < 4:
         sessions += 1
         try:
@@ -1430,7 +1461,10 @@ async def run_url(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, host: str
         unchecked = unchecked or res["unchecked"]
         rows += res["rows"]
         todo = res["todo"]
-    if not unsafe:
+        if res.get("stop"):
+            stopped = True
+            break
+    if not unsafe and not stopped:
         for k, c in todo:  # could not be finished within the available session time
             rows.append(Result(index=idx, order=k, site=url, page_url=url, creative=c.name,
                                size=f"{c.width}x{c.height}", status="ERROR",
@@ -1438,11 +1472,18 @@ async def run_url(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, host: str
     return rows, unsafe, reason, unchecked
 
 
+def article_key(u: str) -> str:
+    return u.split("#")[0].split("?")[0].rstrip("/").lower()
+
+
 async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site: str,
-                       creatives: list[Creative], out_dir: Path, log: LogFn) -> list[Result]:
+                       creatives: list[Creative], out_dir: Path, log: LogFn,
+                       used_articles: Optional[set] = None) -> list[Result]:
     """
     For every creative the agent walks through the latest articles until it gets a screenshot that passes QA:
-      each of the latest articles, real ad slot only (next article if no slot / QA fails / error)
+      walk through the site's articles, real ad slot only (next article if no slot / QA fails / error)
+      EVERY creative gets its OWN article: an article that already produced a screenshot is never used again
+      (not for another creative, and not for another row of the same website in this job).
     A creative with no real slot on any checked article gets NO_SLOT and NO screenshot.
     """
     site_url = normalize_url(site)
@@ -1452,12 +1493,18 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
     def L(msg: str):
         log(f"[{idx}] {host} +{int(time.monotonic() - t0)}s: {msg}")
 
+    used = used_articles if used_articles is not None else set()
+    # enough articles for every creative to get its own, plus spares for articles without a slot
+    want = min(30, max(int(cfg.max_article_tries), 3 * len(creatives)))
     if cfg.find_latest_article:
-        L("looking for the latest articles")
-        candidates = await discover_articles(pw, cfg, gem, site_url, L)
+        L(f"looking for the latest articles (up to {want})")
+        candidates = await discover_articles(pw, cfg, gem, site_url, L, want)
     else:
         candidates = [site_url]
-    candidates = candidates[: max(1, cfg.max_article_tries)]
+    candidates = [u for u in candidates if article_key(u) not in used][:want]
+    if not candidates:
+        return [Result(index=idx, site=site_url, page_url=site_url, status="ERROR",
+                       note="every article found on this site was already used for another screenshot")]
 
     accepted: dict[int, Result] = {}  # creative order -> screenshot that passed
     fallback: dict[int, Result] = {}  # creative order -> best screenshot that failed QA
@@ -1485,6 +1532,8 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
     for n, url in enumerate(candidates, 1):
         if not pending:
             break
+        if article_key(url) in used:
+            continue
         rows, unsafe, reason, unc = await run_url(pw, cfg, gem, idx, host, url, pending, out_dir, L,
                                                   check_safety=cfg.brand_safety)
         if unsafe:
@@ -1494,6 +1543,8 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
         unchecked = unchecked or unc
         safe_urls.append(url)
         absorb(rows)
+        if any(r.status == "OK" for r in rows):
+            used.add(article_key(url))  # one article = one screenshot
         pending = [(k, c) for k, c in pending if k not in accepted]
         if pending:
             L(f"article {n}/{len(candidates)}: {len(pending)} creative(s) still without a passing screenshot"
@@ -1506,7 +1557,11 @@ async def process_site(pw, cfg: JobConfig, gem: Optional[Gemini], idx: int, site
     # ---- final rows ------------------------------------------------------------------------------------------------
     final: list[Result] = []
     for k, c in enumerate(creatives, 1):
-        r = accepted.get(k) or fallback.get(k)
+        r = accepted.get(k)
+        fb = fallback.get(k)
+        if r is None and fb is not None and article_key(fb.site) not in used:
+            r = fb
+            used.add(article_key(fb.site))
         if r is None:
             r = problem.get(k) or Result(index=idx, order=k, site=site_url, page_url=site_url, creative=c.name,
                                          size=f"{c.width}x{c.height}", status="ERROR", note="not processed")
@@ -1547,14 +1602,19 @@ async def run_job(cfg: JobConfig, sites: list[str], creatives: list[Creative], o
     sem = asyncio.Semaphore(max(1, int(cfg.concurrency)))
     results: list[Result] = []
     done = 0
+    used_by_host: dict[str, set] = {}  # articles already screenshotted, per website (shared by all rows of the job)
+    host_locks: dict[str, asyncio.Lock] = {}
 
     async with async_playwright() as pw:
 
         async def worker(i: int, site: str):
             nonlocal done
-            async with sem:
+            hkey = urlparse(normalize_url(site)).netloc.replace("www.", "").lower()
+            lock = host_locks.setdefault(hkey, asyncio.Lock())  # rows of the same website run one after another
+            async with sem, lock:
                 try:
-                    rows = await process_site(pw, cfg, gem, i, site, creatives, out_dir, log)
+                    rows = await process_site(pw, cfg, gem, i, site, creatives, out_dir, log,
+                                              used_articles=used_by_host.setdefault(hkey, set()))
                 except Exception as e:
                     log(f"[{i}] {site}: ERROR {short(e, cfg.browserless_token)}")
                     rows = [Result(index=i, site=site, status="ERROR", note=short(e, cfg.browserless_token))]
